@@ -12,6 +12,8 @@ import plistlib
 import sqlite3
 import time
 import urllib
+import applescript
+
 
 
 __VERSION__ = '1.0'
@@ -228,6 +230,7 @@ def generate_xml(swinsian_db, itunes_xml, itunes_music_folder):
         logging.info("Generating folder playlist information...")
         cur.execute("SELECT * FROM playlist WHERE folder IS NOT NULL")
         rows = cur.fetchall()
+        x = 2
         for x, row in enumerate(rows, 2):
             name = row['name']
             playlist_id = x
@@ -259,7 +262,7 @@ def generate_xml(swinsian_db, itunes_xml, itunes_music_folder):
             name = row['name']
             playlist_id = x
             playlist_persistent_id = "%0.16x".upper() % row["playlist_id"]
-            # retrieve list of playlist tracks that match our current playlist_id
+            # We need to use applescript to get the Playlist tracks.
             cur.execute("SELECT * FROM playlisttrack WHERE playlist_id = %s" % row['playlist_id'])
             playlist_tracks = cur.fetchall()
             # if the playlist isn't empty, construct the playlist data structure
@@ -305,7 +308,75 @@ def generate_xml(swinsian_db, itunes_xml, itunes_music_folder):
 
                 playlist_array.append(playlist)
 
+        # Now we do the same for Smart Playlists
+        cur.execute("SELECT * FROM playlist WHERE folder IS NULL AND smart IS NOT NULL")
+        rows = cur.fetchall()
+        # iterate through playlists
+        for x, row in enumerate(rows, x+1):  # start numbering playlists from where we left off
+            applescript_id = row['applescriptid']
+            x = int(x)
+            playlist_id = x
+            playlist_persistent_id = "%0.16x".upper() % row["playlist_id"]
+            # pass off to Applescript to get Smart Playlist tracks
+            #We pass in the Applescript ID from the swinsian Database and retrieve the respective track IDs
+            scpt = applescript.AppleScript('''
+                                           on run arg1
+                                                tell application "Swinsian"
+                                                    set thepl to the first playlist whose id is arg1
+                                                    set trackidlist to id of tracks of thepl
+
+                                                end tell
+                                                return trackidlist
+                                            end run
+            ''')
+            playlist_tracks = scpt.run(applescript_id)
+            #Script returns list of strings, so we convert them to integers
+            playlist_tracks = [int(i) for i in playlist_tracks]
+            if playlist_tracks:
+                playlist_items = []
+                for playlist_track in playlist_tracks:
+                    track_id = playlist_tracks[playlist_tracks.index(playlist_track)]
+                    playlist_track_dict = {'Track ID': track_id}
+                    playlist_items.append(playlist_track_dict)
+                playlist = {'Name': name,
+                            'Playlist ID': playlist_id,
+                            'Playlist Persistent ID': playlist_persistent_id,
+                            'All Items': True,
+                            'Playlist Items': playlist_items}
+                # determine if we are inside a folder in order to set playlist's parent persistent ID attribute
+                cur.execute('SELECT * FROM playlistfolderplaylist WHERE playlist_id = %s' % row["playlist_id"])
+                playlist_parent = cur.fetchall()
+                if len(playlist_parent) > 1:
+                    # there shouldn't be more than 1 parent returned in the DB query
+                    logging.critical("Unexpected situation: more than one parent associated with playlist ... aborting!")
+                    sys.exit()
+                elif len(playlist_parent) == 1 and playlist_parent[0]['playlistfolder_id']:
+                    # playlist does have a parent folder
+                    # set the playlist's parent k/v
+                    parent_persistent_id = "%0.16x".upper() % playlist_parent[0]['playlistfolder_id']
+                    playlist['Parent Persistent ID'] = parent_persistent_id
+                    # populate the playlist_items to each parent -- all the way up the playlist hierarchy tree
+                    while parent_persistent_id:
+                        # now we need to add the 'track ids' of this playlist to its parent folder 'playlist items'
+                        for i, item in enumerate(playlist_array):  # search for parent playlist/folder through simple iteration
+                            if item['Playlist Persistent ID'] == parent_persistent_id:  # found playlist/folder matching parent
+                                playlist_array[i]['Playlist Items'].extend(playlist_items)  # add playlist's items to parent folder playlist
+                                # if the parent also has a parent, reset our parent_persistent_id cursor to it
+                                # we do this because we have to attach current playlist to all playlists in the hierarchy,
+                                # not just the direct parent
+                                if 'Parent Persistent ID' in playlist_array[i]:
+                                    parent_persistent_id = playlist_array[i]['Parent Persistent ID']
+                                else:
+                                    # no parent, we are at top of hierarchy
+                                    parent_persistent_id = None  # leave while loop during next eval
+                                break  # we found the parent, no need to continue searching -- break out of for loop
+                        else:
+                            parent_persistent_id = None  # technically we should never hit this, but handle it just in case
+
+                playlist_array.append(playlist)
+
         plist_dict['Playlists'] = playlist_array
+        logging.info(playlist_array)
         # Write out plist file
         logging.info('Outputting iTunes XML to \'%s\'...' % itunes_xml)
         plistlib.writePlist(plist_dict, itunes_xml)
